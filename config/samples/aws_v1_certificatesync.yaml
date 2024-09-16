@@ -1,0 +1,9 @@
+apiVersion: aws.stilll.fr/v1
+kind: CertificateSync
+metadata:
+  labels:
+    app.kubernetes.io/name: acm-cmcertificate-sync
+    app.kubernetes.io/managed-by: kustomize
+  name: certificatesync-sample
+spec:
+  # TODO(user): Add fields here

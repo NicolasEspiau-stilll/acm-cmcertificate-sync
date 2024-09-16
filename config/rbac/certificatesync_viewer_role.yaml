@@ -1,0 +1,23 @@
+# permissions for end users to view certificatesyncs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: acm-cmcertificate-sync
+    app.kubernetes.io/managed-by: kustomize
+  name: certificatesync-viewer-role
+rules:
+- apiGroups:
+  - aws.stilll.fr
+  resources:
+  - certificatesyncs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - aws.stilll.fr
+  resources:
+  - certificatesyncs/status
+  verbs:
+  - get
