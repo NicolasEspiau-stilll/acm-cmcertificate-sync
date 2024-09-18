@@ -1,0 +1,52 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "chart.serviceAccountName" . }}-role
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+rules:
+  # Permissions for cert-manager's Certificate resources
+  - apiGroups:
+      - cert-manager.io
+    resources:
+      - certificates
+    verbs:
+      - get
+      - list
+      - watch
+      - update   # Allows updating certificates, including finalizers
+      - patch    # Allows patching certificates, necessary for finalizers
+
+  # Permissions for Secrets (needed to read certificate data)
+  - apiGroups: ['']
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Optionally, other resources that your controller needs access to
+  - apiGroups: ['']
+    resources:
+      - configmaps
+      - events
+    verbs:
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "chart.serviceAccountName" . }}-rolebinding
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "chart.serviceAccountName" . }} # The service account used by your controller
+    namespace: {{ .Release.Namespace }} # Namespace where the service account is located
+roleRef:
+  kind: ClusterRole
+  name: {{ include "chart.serviceAccountName" . }}-role # The ClusterRole defined above
+  apiGroup: rbac.authorization.k8s.io

@@ -1,4 +1,0 @@
-## Append samples of your project ##
-resources:
-- aws_v1_certificatesync.yaml
-# +kubebuilder:scaffold:manifestskustomizesamples
