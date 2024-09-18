@@ -2,9 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"testing"
 
@@ -20,31 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const certManagerCRDURL = "https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.crds.yaml"
-
-func downloadCRDs(url string, filename string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(filename, body, 0644)
-}
-
 func TestMain(m *testing.M) {
-	// Dynamically download the CRDs to a temp file
-	crdFile := "testdata/crds/cert-manager-crds.yaml"
-	err := downloadCRDs(certManagerCRDURL, crdFile)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to download CRDs: %v", err))
-	}
-
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
 			"testdata/crds", // Path to dynamically downloaded CRDs
@@ -67,14 +40,6 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-
-	// Debug: List available CRDs in the test environment
-	// crdList := &apiextensionsv1.CustomResourceDefinitionList{}
-	// err = k8sClient.List(context.TODO(), crdList)
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// fmt.Printf("Available CRDs: %v\n", crdList.Items)
 
 	// Run the tests
 	code := m.Run()

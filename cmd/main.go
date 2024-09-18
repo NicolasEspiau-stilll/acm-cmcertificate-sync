@@ -25,6 +25,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -36,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/controller"
+	services "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -142,8 +144,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Register Cert Manager API with the scheme
+	if err := certmanagerv1.AddToScheme(mgr.GetScheme()); err != nil {
+		setupLog.Error(err, "unable to add cert-manager v1 to scheme")
+		os.Exit(1)
+	}
+
+	// Instantiate the AWS ACM service
+	awsACMService, err := services.NewAWSACMService(os.Getenv("AWS_REGION"))
+	if err != nil {
+		setupLog.Error(err, "unable to create AWS ACM service")
+		os.Exit(1)
+	}
+
 	if err = (&controller.CertManagerCertificateReconciler{
-		Client: mgr.GetClient(),
+		Client:        mgr.GetClient(),
+		Log:           ctrl.Log.WithName("controllers").WithName("CertificateSync"),
+		Scheme:        mgr.GetScheme(),
+		AWSACMService: awsACMService,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CertificateSync")
 		os.Exit(1)

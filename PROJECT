@@ -4,17 +4,8 @@
 # More info: https://book.kubebuilder.io/reference/project-config.html
 domain: stilll.fr
 layout:
-- go.kubebuilder.io/v4
+  - go.kubebuilder.io/v4
 projectName: acm-cmcertificate-sync
 repo: github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git
 resources:
-- api:
-    crdVersion: v1
-    namespaced: true
-  controller: true
-  domain: stilll.fr
-  group: aws
-  kind: CertificateSync
-  path: github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/api/v1
-  version: v1
-version: "3"
+version: '3'

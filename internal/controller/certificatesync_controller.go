@@ -8,22 +8,25 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/acm"
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	aws_acm_svc "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
 )
 
 type CertManagerCertificateReconciler struct {
 	client.Client
-	Log logr.Logger
+	Log           logr.Logger
+	Scheme        *runtime.Scheme
+	AWSACMService *aws_acm_svc.AWSACMService
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -110,11 +113,44 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 	var certificate certmanagerv1.Certificate
 	if err := r.Get(ctx, req.NamespacedName, &certificate); err != nil {
 		if errors.IsNotFound(err) {
-			log.Info("Certificate resource not found. Ignoring since object must be deleted.")
+			log.Info("Certificate resource not found in cluster. Deleting from AWS Certificate Manager.")
+			// Loop over the DNS names in the certificate and delete the certificate for each domain
+			for _, dnsName := range certificate.Spec.DNSNames {
+				err := r.AWSACMService.DeleteCertificateByCommonName(dnsName)
+				if err != nil {
+					log.Error(err, "Failed to delete certificate from AWS ACM")
+					return ctrl.Result{}, err
+				}
+			}
+
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Failed to get Certificate")
 		return ctrl.Result{}, err
+	}
+
+	// Check if the certificate is marked for deletion
+	if certificate.GetDeletionTimestamp() != nil {
+		log.Info("Certificate is marked for deletion. Deleting from AWS Certificate Manager.")
+		// Loop over the DNS names in the certificate and delete the certificate for each domain
+		for _, dnsName := range certificate.Spec.DNSNames {
+			err := r.AWSACMService.DeleteCertificateByCommonName(dnsName)
+			if err != nil {
+				log.Error(err, "Failed to delete certificate from AWS ACM")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Remove the finalizer after cleanup
+		if err := r.removeFinalizer(&certificate); err != nil {
+			return reconcile.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Add the finalizer if it doesn't exist
+	if err := r.addFinalizer(&certificate); err != nil {
+		return reconcile.Result{}, err
 	}
 
 	// Check if the certificate is ready by looking at its conditions
@@ -142,7 +178,6 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 	// Extract the certificate, private key, and certificate chain from the secret
 	certData, certExists := secret.Data["tls.crt"]
 	keyData, keyExists := secret.Data["tls.key"]
-	chainData := secret.Data["tls.chain"] // Optional
 
 	if !certExists || !keyExists {
 		log.Error(fmt.Errorf("secret data missing required fields"), "Secret does not contain required certificate data")
@@ -150,40 +185,58 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 	}
 
 	// Import the certificate into AWS ACM
-	if err := r.importCertificateToACM(certData, keyData, chainData); err != nil {
-		log.Error(err, "Failed to import certificate to AWS ACM")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	// Loop over the DNS names in the certificate and import the certificate for each domain
+	for _, dnsName := range certificate.Spec.DNSNames {
+		if err := r.AWSACMService.ImportOrUpdateCertificate(dnsName, string(certData), string(keyData)); err != nil {
+			log.Error(err, "Failed to import certificate to AWS ACM")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 
 	log.Info("Successfully imported certificate to AWS ACM")
 	return ctrl.Result{}, nil
 }
 
-// importCertificateToACM will handle importing the certificate to ACM
-func (r *CertManagerCertificateReconciler) importCertificateToACM(certData, keyData, chainData []byte) error {
-	awsRegion := os.Getenv("AWS_REGION")
+const certificateFinalizer = "acm-cmcertificate-sync/finalizer"
 
-	// Initialize AWS session with the region from environment variable
-	sess, err := session.NewSession(&aws.Config{
-		Region: aws.String(awsRegion),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create AWS session: %w", err)
+// Add the finalizer to the certificate if it doesn't exist
+func (r *CertManagerCertificateReconciler) addFinalizer(cert *certmanagerv1.Certificate) error {
+	if !containsString(cert.GetFinalizers(), certificateFinalizer) {
+		cert.SetFinalizers(append(cert.GetFinalizers(), certificateFinalizer))
+		if err := r.Update(context.TODO(), cert); err != nil {
+			return err
+		}
 	}
-
-	svc := acm.New(sess)
-
-	// Import the certificate into ACM
-	input := &acm.ImportCertificateInput{
-		Certificate:      certData,  // Extracted from secret
-		PrivateKey:       keyData,   // Extracted from secret
-		CertificateChain: chainData, // Optional, extracted from secret
-	}
-
-	_, err = svc.ImportCertificate(input)
-	if err != nil {
-		return fmt.Errorf("failed to import certificate: %w", err)
-	}
-
 	return nil
+}
+
+// Remove the finalizer from the certificate
+func (r *CertManagerCertificateReconciler) removeFinalizer(cert *certmanagerv1.Certificate) error {
+	if containsString(cert.GetFinalizers(), certificateFinalizer) {
+		cert.SetFinalizers(removeString(cert.GetFinalizers(), certificateFinalizer))
+		if err := r.Update(context.TODO(), cert); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Helper functions for handling finalizers
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(slice []string, s string) []string {
+	var result []string
+	for _, item := range slice {
+		if item != s {
+			result = append(result, item)
+		}
+	}
+	return result
 }
