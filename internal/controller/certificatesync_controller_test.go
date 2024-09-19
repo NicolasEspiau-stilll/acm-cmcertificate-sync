@@ -5,6 +5,8 @@ import (
 	"os"
 	"testing"
 
+	services "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
+
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -15,6 +17,60 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+var (
+	validcertname        = "test-cert"
+	validcertnamespace   = "default"
+	validsecretname      = "test-secret"
+	validsecretnamespace = "default"
+	validcertificate     = &certmanagerv1.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      validcertname,
+			Namespace: validcertnamespace,
+		},
+		Spec: certmanagerv1.CertificateSpec{
+			SecretName: validsecretname,
+			DNSNames:   []string{"example.com"},
+		},
+	}
+	validsecret = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      validsecretname,
+			Namespace: validsecretnamespace,
+		},
+		Data: map[string][]byte{
+			"tls.crt":   []byte("fake-cert-data"),
+			"tls.key":   []byte("fake-key-data"),
+			"tls.chain": []byte("fake-chain-data"),
+		},
+	}
+
+	certnotreadyname        = "test-cert-not-ready"
+	certnotreadynamespace   = "default"
+	secretnotreadyname      = "secret-not-ready"
+	secretnotreadynamespace = "default"
+	certificatenotready     = &certmanagerv1.Certificate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      certnotreadyname,
+			Namespace: certnotreadynamespace,
+		},
+		Spec: certmanagerv1.CertificateSpec{
+			SecretName: secretnotreadyname,
+			DNSNames:   []string{"example.com"},
+		},
+	}
+	secretnotready = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretnotreadyname,
+			Namespace: secretnotreadynamespace,
+		},
+		Data: map[string][]byte{
+			"tls.crt":   []byte("fake-cert-data"),
+			"tls.key":   []byte("fake-key-data"),
+			"tls.chain": []byte("fake-chain-data"),
+		},
+	}
 )
 
 func TestMain(m *testing.M) {
@@ -41,6 +97,9 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 
+	os.Setenv("WATCHED_NAMESPACES", "default")
+	os.Setenv("DOMAIN_PATTERNS", "*.example.com")
+
 	// Run the tests
 	code := m.Run()
 
@@ -55,57 +114,41 @@ func TestMain(m *testing.M) {
 }
 
 func TestCertManagerCertificateReconciler_Reconcile(t *testing.T) {
-	os.Setenv("WATCHED_NAMESPACES", "default")
-	os.Setenv("DOMAIN_PATTERNS", "*.example.com")
-	// Create the reconciler
-	reconciler := &CertManagerCertificateReconciler{
-		Client: k8sClient,
-		Log:    zap.New(zap.UseDevMode(true)),
-	}
+	err := k8sClient.Create(context.TODO(), validcertificate)
+	assert.NoError(t, err)
 
-	// Setup: Create a test Certificate resource and Secret
-	certificate := &certmanagerv1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cert",
-			Namespace: "default",
-		},
-		Spec: certmanagerv1.CertificateSpec{
-			SecretName: "test-secret",
-			DNSNames:   []string{"example.com"},
-		},
-		Status: certmanagerv1.CertificateStatus{
-			Conditions: []certmanagerv1.CertificateCondition{
-				{
-					Type:   certmanagerv1.CertificateConditionReady,
-					Status: "True",
-				},
+	// Update the status of the Certificate resource
+	validcertificate.Status = certmanagerv1.CertificateStatus{
+		Conditions: []certmanagerv1.CertificateCondition{
+			{
+				Type:   certmanagerv1.CertificateConditionReady,
+				Status: "True",
 			},
 		},
 	}
 
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-secret",
-			Namespace: "default",
-		},
-		Data: map[string][]byte{
-			"tls.crt":   []byte("fake-cert-data"),
-			"tls.key":   []byte("fake-key-data"),
-			"tls.chain": []byte("fake-chain-data"),
-		},
+	err = k8sClient.Status().Update(context.TODO(), validcertificate)
+	assert.NoError(t, err)
+
+	err = k8sClient.Create(context.TODO(), validsecret)
+	assert.NoError(t, err)
+
+	// Instantiate the AWSACMServiceMock
+	awsACMServiceMock := new(services.AWSACMServiceMock)
+	awsACMServiceMock.On("ImportOrUpdateCertificate", "example.com", "fake-cert-data", "fake-key-data").Return(nil)
+
+	// Create the reconciler
+	reconciler := &CertManagerCertificateReconciler{
+		AWSACMService: awsACMServiceMock,
+		Client:        k8sClient,
+		Log:           zap.New(zap.UseDevMode(true)),
 	}
-
-	err := k8sClient.Create(context.TODO(), certificate)
-	assert.NoError(t, err)
-
-	err = k8sClient.Create(context.TODO(), secret)
-	assert.NoError(t, err)
 
 	// Reconcile request for the certificate
 	req := reconcile.Request{
 		NamespacedName: types.NamespacedName{
-			Name:      "test-cert",
-			Namespace: "default",
+			Name:      validcertname,
+			Namespace: validcertnamespace,
 		},
 	}
 
@@ -114,47 +157,85 @@ func TestCertManagerCertificateReconciler_Reconcile(t *testing.T) {
 	assert.False(t, res.Requeue)
 
 	// Assert that the certificate was processed correctly
+	awsACMServiceMock.AssertCalled(t, "ImportOrUpdateCertificate", "example.com", "fake-cert-data", "fake-key-data")
+	awsACMServiceMock.AssertExpectations(t)
 }
 
 func TestCertManagerCertificateReconciler_CertificateNotReady(t *testing.T) {
-	// Test for when the certificate is not ready
-	certificate := &certmanagerv1.Certificate{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "not-ready-cert",
-			Namespace: "default",
-		},
-		Spec: certmanagerv1.CertificateSpec{
-			SecretName: "not-ready-secret",
-			DNSNames:   []string{"example.com"},
-		},
-		Status: certmanagerv1.CertificateStatus{
-			Conditions: []certmanagerv1.CertificateCondition{
-				{
-					Type:   certmanagerv1.CertificateConditionReady,
-					Status: "False", // Not ready
-				},
+	err := k8sClient.Create(context.TODO(), certificatenotready)
+	assert.NoError(t, err)
+
+	// Update the status of the Certificate resource
+	certificatenotready.Status = certmanagerv1.CertificateStatus{
+		Conditions: []certmanagerv1.CertificateCondition{
+			{
+				Type:   certmanagerv1.CertificateConditionReady,
+				Status: "False",
 			},
 		},
 	}
 
-	err := k8sClient.Create(context.TODO(), certificate)
+	err = k8sClient.Status().Update(context.TODO(), certificatenotready)
 	assert.NoError(t, err)
 
-	req := reconcile.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "not-ready-cert",
-			Namespace: "default",
-		},
+	err = k8sClient.Create(context.TODO(), secretnotready)
+	assert.NoError(t, err)
+
+	// Instantiate the AWSACMServiceMock
+	awsACMServiceMock := new(services.AWSACMServiceMock)
+
+	// Create the reconciler
+	reconciler := &CertManagerCertificateReconciler{
+		AWSACMService: awsACMServiceMock,
+		Client:        k8sClient,
+		Log:           zap.New(zap.UseDevMode(true)),
 	}
 
-	reconciler := &CertManagerCertificateReconciler{
-		Client: k8sClient,
-		Log:    zap.New(zap.UseDevMode(true)),
+	// Reconcile request for the certificate
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      certnotreadyname,
+			Namespace: certnotreadynamespace,
+		},
 	}
 
 	res, err := reconciler.Reconcile(context.TODO(), req)
 	assert.NoError(t, err)
 	assert.False(t, res.Requeue)
 
-	// Assert that the certificate was skipped because it's not ready
+	// Assert that the certificate wasn't processed
+	awsACMServiceMock.AssertNotCalled(t, "ImportOrUpdateCertificate")
+	awsACMServiceMock.AssertExpectations(t)
+}
+
+func TestCertManagerCertificateReconciler_CertificateDeleted(t *testing.T) {
+	err := k8sClient.Delete(context.TODO(), validcertificate)
+	assert.NoError(t, err)
+
+	// Instantiate the AWSACMServiceMock
+	awsACMServiceMock := new(services.AWSACMServiceMock)
+	awsACMServiceMock.On("DeleteCertificateByCommonName", "example.com").Return(nil)
+
+	// Create the reconciler
+	reconciler := &CertManagerCertificateReconciler{
+		AWSACMService: awsACMServiceMock,
+		Client:        k8sClient,
+		Log:           zap.New(zap.UseDevMode(true)),
+	}
+
+	// Reconcile request for the certificate
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      validcertname,
+			Namespace: validcertnamespace,
+		},
+	}
+
+	res, err := reconciler.Reconcile(context.TODO(), req)
+	assert.NoError(t, err)
+	assert.False(t, res.Requeue)
+
+	// Assert that the certificate was deleted
+	awsACMServiceMock.AssertCalled(t, "DeleteCertificateByCommonName", "example.com")
+	awsACMServiceMock.AssertExpectations(t)
 }

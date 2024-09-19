@@ -19,14 +19,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	aws_acm_svc "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
+	services "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
 )
 
 type CertManagerCertificateReconciler struct {
 	client.Client
 	Log           logr.Logger
 	Scheme        *runtime.Scheme
-	AWSACMService *aws_acm_svc.AWSACMService
+	AWSACMService services.AWSACMServiceInterface
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -121,6 +121,7 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 					log.Error(err, "Failed to delete certificate from AWS ACM")
 					return ctrl.Result{}, err
 				}
+				log.Info("Successfully deleted certificate from AWS ACM for domain", "domain", dnsName)
 			}
 
 			return ctrl.Result{}, nil
@@ -139,6 +140,7 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 				log.Error(err, "Failed to delete certificate from AWS ACM")
 				return ctrl.Result{}, err
 			}
+			log.Info("Successfully deleted certificate from AWS ACM for domain", "domain", dnsName)
 		}
 
 		// Remove the finalizer after cleanup
@@ -157,6 +159,7 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 	isReady := false
 	for _, cond := range certificate.Status.Conditions {
 		if cond.Type == certmanagerv1.CertificateConditionReady && cond.Status == "True" {
+			log.Info("Certificate is ready, proceeding with reconciliation.")
 			isReady = true
 			break
 		}

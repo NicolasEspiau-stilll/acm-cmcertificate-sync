@@ -1,9 +1,7 @@
-package aws_acm
+package services
 
 import (
-	"encoding/pem"
 	"fmt"
-	"strings"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -11,6 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/acm"
 	"github.com/go-logr/logr"
+
+	helpers "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/helpers"
 )
 
 type AWSACMService struct {
@@ -63,7 +63,7 @@ func (svc *AWSACMService) ImportOrUpdateCertificate(domain string, certData stri
 	}
 
 	// Split the certificate into leaf certificate and certificate chain
-	leafCert, certChain, err := splitCertificateAndChain(certData)
+	leafCert, certChain, err := helpers.SplitCertificateAndChain(certData)
 	if err != nil {
 		svc.Log.Error(err, "failed to split certificate and chain")
 		return err
@@ -100,37 +100,6 @@ func (svc *AWSACMService) ImportOrUpdateCertificate(domain string, certData stri
 	}
 
 	return nil
-}
-
-// Helper function to split the leaf certificate and the certificate chain
-func splitCertificateAndChain(certData string) (string, string, error) {
-	var leafCert string
-	var certChain string
-
-	// Iterate over the certData and split based on PEM blocks
-	var pemBlocks []string
-	for {
-		block, rest := pem.Decode([]byte(certData))
-		if block == nil {
-			break
-		}
-		pemBlocks = append(pemBlocks, string(pem.EncodeToMemory(block)))
-		certData = string(rest)
-	}
-
-	if len(pemBlocks) < 1 {
-		return "", "", fmt.Errorf("no valid PEM blocks found")
-	}
-
-	// The first certificate is usually the leaf certificate
-	leafCert = pemBlocks[0]
-
-	// The rest form the certificate chain (intermediate certificates)
-	if len(pemBlocks) > 1 {
-		certChain = strings.Join(pemBlocks[1:], "")
-	}
-
-	return leafCert, certChain, nil
 }
 
 // Function to delete a certificate from ACM by its domain
