@@ -1,10 +1,97 @@
-# acm-cmcertificate-sync
-// TODO(user): Add simple overview of use/purpose
+# AWS Certificate Manager / Kube CertManager Sync
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
 
-## Getting Started
+This Kubernetes addon will automatically:
+- import Certificates issued by Cert Manager in your cluster to AWS Cert Manager
+- delete from AWS Cert Manager all Certificates deleted from your cluster
+
+It's designed for AWS clusters (EKS or not) as it will use AWS IAM Role and perform ACM actions.
+
+## Read this if you're a user
+
+### Pre-requisites
+- kubectl version v1.11.3+.
+- Access to a Kubernetes v1.11.3+ cluster.
+- Helm v3.13.1+
+- AWS IAM Role as designed here after.
+
+#### AWS IAM Role policy
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "acm:ImportCertificate",
+                "acm:DescribeCertificate",
+                "acm:DeleteCertificate",
+                "acm:ListCertificates"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+```
+
+#### AWS IAM Role trust relationship
+
+If you're using [kube2iam](https://github.com/jtblin/kube2iam) see the [docs](https://github.com/jtblin/kube2iam?tab=readme-ov-file#iam-roles).
+
+If you're working with an EKS cluster and and OIDC provider:
+```json
+{
+    "Version": "2012-10-17",
+    "Statement" : [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "<oidc_provider_arn>"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "<oidc_provider>:aud": "sts.amazonaws.com",
+                    "<oidc_provider>:sub": "system:serviceaccount:<ACMCMSYNC_NAMESPACE>:<ACMCMSYNC_SA_NAME>"
+                }
+            }
+        }
+    ]
+}
+```
+Where:
+- `<oidc_provider_arn>` should look like ``
+- `<oidc_provider>` should look like ``
+- `<ACMCMSYNC_NAMESPACE>` is the namespace where you will deploy the addon
+- `<ACMCMSYNC_SA_NAME>` is the addon's service account's name set in the values
+
+
+If you deploy the Service Account with Helm, don't forget to set the annotation properly to make it use the AWS IAM Role.
+Same if you create the Service Account outside the Helm deployment.
+
+### Deploying with Helm
+
+```sh
+helm repo add acm-cmcertificate-sync nicolasespiau-stilll.github.io/acm-cmcertificate-sync
+helm repo update
+helm show values acm-cmcertificate-sync/acm-cmcertificate-sync > path/to/values.yaml
+```
+
+In the values, you can update the AWS Region, the domain filters that must be matched to sync certificates, and the namespaces where you want ACM CM Cert Sync to watch Certi
+
+Update your values and deploy:
+```sh
+helm install --namespace acm-cm-sync --create-namespace acm-cm-sync acm-cmcertificate-sync/acm-cmcertificate-sync -f path/to/values.yaml
+```
+
+## Read this if you are developer
+
+And you want to contribute, or simply fork and use the project on your side.
+
+> [!WARNING]
+> I am not a proefficient Go developer. I chose Go because it works well with kubernetes api but I'm so bad at writting tests.
+> Don't hesitate to fork and create pull requests with tests (or any other improvement).
 
 ### Prerequisites
 - go version v1.22.0+
@@ -13,6 +100,11 @@
 - Access to a Kubernetes v1.11.3+ cluster.
 
 ### To Deploy on the cluster
+
+> [!WARNING]
+> I chose to remove the kustomize based deploy commands because I prefer working with helm and I would have make 
+> mistakes. Feel free to contribute and restore them.
+
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
@@ -22,49 +114,6 @@ make docker-build docker-push IMG=<some-registry>/acm-cmcertificate-sync:tag
 **NOTE:** This image ought to be published in the personal registry you specified.
 And it is required to have access to pull the image from the working environment.
 Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
-make install
-```
-
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/acm-cmcertificate-sync:tag
-```
-
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
 
 ## Project Distribution
 
@@ -98,17 +147,4 @@ More information can be found via the [Kubebuilder Documentation](https://book.k
 
 ## License
 
-Copyright 2024.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.
