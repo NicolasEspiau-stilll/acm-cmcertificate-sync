@@ -129,6 +129,7 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
+<<<<<<< Updated upstream
 	// Check if the certificate is marked for deletion
 	if certificate.GetDeletionTimestamp() != nil {
 		log.Info("Certificate is marked for deletion. Deleting from AWS Certificate Manager.")
@@ -148,6 +149,8 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, nil
 	}
 
+=======
+>>>>>>> Stashed changes
 	// Add the finalizer if it doesn't exist
 	if err := r.addFinalizer(&certificate); err != nil {
 		return reconcile.Result{}, err
