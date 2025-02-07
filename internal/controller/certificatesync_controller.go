@@ -129,28 +129,6 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 		return ctrl.Result{}, err
 	}
 
-<<<<<<< Updated upstream
-	// Check if the certificate is marked for deletion
-	if certificate.GetDeletionTimestamp() != nil {
-		log.Info("Certificate is marked for deletion. Deleting from AWS Certificate Manager.")
-		// Loop over the DNS names in the certificate and delete the certificate for each domain
-		for _, dnsName := range certificate.Spec.DNSNames {
-			err := r.AWSACMService.DeleteCertificateByCommonName(dnsName)
-			if err != nil {
-				log.Error(err, "Failed to delete certificate from AWS ACM")
-				return ctrl.Result{}, err
-			}
-		}
-
-		// Remove the finalizer after cleanup
-		if err := r.removeFinalizer(&certificate); err != nil {
-			return reconcile.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
-=======
->>>>>>> Stashed changes
 	// Add the finalizer if it doesn't exist
 	if err := r.addFinalizer(&certificate); err != nil {
 		return reconcile.Result{}, err
@@ -213,17 +191,6 @@ func (r *CertManagerCertificateReconciler) addFinalizer(cert *certmanagerv1.Cert
 	return nil
 }
 
-// Remove the finalizer from the certificate
-func (r *CertManagerCertificateReconciler) removeFinalizer(cert *certmanagerv1.Certificate) error {
-	if containsString(cert.GetFinalizers(), certificateFinalizer) {
-		cert.SetFinalizers(removeString(cert.GetFinalizers(), certificateFinalizer))
-		if err := r.Update(context.TODO(), cert); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Helper functions for handling finalizers
 func containsString(slice []string, s string) bool {
 	for _, item := range slice {
@@ -232,14 +199,4 @@ func containsString(slice []string, s string) bool {
 		}
 	}
 	return false
-}
-
-func removeString(slice []string, s string) []string {
-	var result []string
-	for _, item := range slice {
-		if item != s {
-			result = append(result, item)
-		}
-	}
-	return result
 }
