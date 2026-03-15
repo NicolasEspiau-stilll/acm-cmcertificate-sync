@@ -1,4 +1,4 @@
-package aws_acm
+package awsacm
 
 import (
 	"encoding/pem"
@@ -13,7 +13,6 @@ import (
 	"github.com/go-logr/logr"
 )
 
-type AWSACMService struct {
 	client *acm.ACM
 	Log    logr.Logger
 }
@@ -69,40 +68,34 @@ func (svc *AWSACMService) ImportOrUpdateCertificate(domain string, certData stri
 		return err
 	}
 
-	// If the certificate exists, update it
+	// If the certificate exists, delete it first (ACM does not support update via ImportCertificate with ARN)
 	if certSummary != nil {
-		// Import the new certificate
-		importInput := &acm.ImportCertificateInput{
-			CertificateArn:   certSummary.CertificateArn,
-			Certificate:      []byte(leafCert),
-			CertificateChain: []byte(certChain),
-			PrivateKey:       []byte(privateKey),
+		delInput := &acm.DeleteCertificateInput{
+			CertificateArn: certSummary.CertificateArn,
 		}
-		_, err := svc.client.ImportCertificate(importInput)
+		_, err := svc.client.DeleteCertificate(delInput)
 		if err != nil {
-			svc.Log.Error(err, "failed to update ACM certificate")
+			svc.Log.Error(err, "failed to delete existing ACM certificate before re-import", "domain", domain)
 			return err
 		}
-		fmt.Printf("Updated ACM certificate `%s` for domain: %s", *certSummary.CertificateArn, domain)
-	} else {
-		// If no certificate exists, import a new one
-		importInput := &acm.ImportCertificateInput{
-			Certificate:      []byte(leafCert),
-			CertificateChain: []byte(certChain),
-			PrivateKey:       []byte(privateKey),
-		}
-		_, err := svc.client.ImportCertificate(importInput)
-		if err != nil {
-			svc.Log.Error(err, "failed to import ACM certificate")
-			return err
-		}
-		svc.Log.Info("Imported new ACM certificate for domain", "domain", domain)
+		svc.Log.Info("Deleted existing ACM certificate before re-import", "certificateArn", *certSummary.CertificateArn, "domain", domain)
 	}
-
+	// Import the certificate (new or after delete)
+	importInput := &acm.ImportCertificateInput{
+		Certificate:      []byte(leafCert),
+		CertificateChain: []byte(certChain),
+		PrivateKey:       []byte(privateKey),
+	}
+	_, err = svc.client.ImportCertificate(importInput)
+	if err != nil {
+		svc.Log.Error(err, "failed to import ACM certificate", "domain", domain)
+		return err
+	}
+	svc.Log.Info("Imported ACM certificate", "domain", domain)
 	return nil
 }
 
-// Helper function to split the leaf certificate and the certificate chain
+// splitCertificateAndChain sépare le certificat leaf et la chaîne intermédiaire (TODO: tester ce helper)
 func splitCertificateAndChain(certData string) (string, string, error) {
 	var leafCert string
 	var certChain string

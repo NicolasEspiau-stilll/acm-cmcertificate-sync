@@ -1,3 +1,5 @@
+// TODO: Pour la suppression propre dans AWS ACM, il faut stocker les DNSNames dans une annotation ou dans le finalizer lors de la création du certificat.
+// TODO: Ajouter des tests unitaires sur les helpers (namespaceFilter, domainPatternFilter, matchDomainPattern, etc).
 package controller
 
 import (
@@ -111,18 +113,13 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 
 	// Fetch the Certificate resource from Cert Manager
 	var certificate certmanagerv1.Certificate
-	if err := r.Get(ctx, req.NamespacedName, &certificate); err != nil {
+	err := r.Get(ctx, req.NamespacedName, &certificate)
+	if err != nil {
 		if errors.IsNotFound(err) {
-			log.Info("Certificate resource not found in cluster. Deleting from AWS Certificate Manager.")
-			// Loop over the DNS names in the certificate and delete the certificate for each domain
-			for _, dnsName := range certificate.Spec.DNSNames {
-				err := r.AWSACMService.DeleteCertificateByCommonName(dnsName)
-				if err != nil {
-					log.Error(err, "Failed to delete certificate from AWS ACM")
-					return ctrl.Result{}, err
-				}
-			}
-
+			log.Info("Certificate resource not found in cluster. Attempting cleanup in AWS ACM.")
+			// TODO: Stocker les DNSNames dans une annotation ou dans le finalizer lors de la création pour pouvoir les retrouver ici
+			// Pour l'instant, on ne peut pas supprimer proprement sans cette info
+			// log.Info("Cannot delete from ACM: DNSNames unknown after K8s deletion")
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Failed to get Certificate")
@@ -132,6 +129,26 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 	// Add the finalizer if it doesn't exist
 	if err := r.addFinalizer(&certificate); err != nil {
 		return reconcile.Result{}, err
+	}
+	// Handle deletion: if DeletionTimestamp is set, remove from ACM and remove finalizer
+	if !certificate.ObjectMeta.DeletionTimestamp.IsZero() {
+		// TODO: Utiliser une annotation pour retrouver les DNSNames ici
+		// for _, dnsName := range certificate.Spec.DNSNames { ... }
+		// Remove our finalizer to allow deletion to complete
+		finalizers := certificate.GetFinalizers()
+		newFinalizers := []string{}
+		for _, f := range finalizers {
+			if f != certificateFinalizer {
+				newFinalizers = append(newFinalizers, f)
+			}
+		}
+		certificate.SetFinalizers(newFinalizers)
+		if err := r.Update(ctx, &certificate); err != nil {
+			log.Error(err, "Failed to remove finalizer")
+			return ctrl.Result{}, err
+		}
+		log.Info("Finalizer removed, resource can be deleted")
+		return ctrl.Result{}, nil
 	}
 
 	// Check if the certificate is ready by looking at its conditions
