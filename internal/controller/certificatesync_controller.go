@@ -1,9 +1,9 @@
-// TODO: Pour la suppression propre dans AWS ACM, il faut stocker les DNSNames dans une annotation ou dans le finalizer lors de la création du certificat.
-// TODO: Ajouter des tests unitaires sur les helpers (namespaceFilter, domainPatternFilter, matchDomainPattern, etc).
 package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,89 +11,144 @@ import (
 	"time"
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	aws_acm_svc "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
+	awsacm "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync/internal/services"
 )
+
+const (
+	// certificateFinalizer blocks Certificate deletion until the ACM copy is removed.
+	certificateFinalizer = "acm-cmcertificate-sync.stilll.fr/finalizer"
+	// annotationARN tracks the ACM certificate this Certificate is synced to.
+	annotationARN = "acm-cmcertificate-sync.stilll.fr/certificate-arn"
+	// annotationHash stores a digest of the last imported certificate, so
+	// unchanged certificates are not re-imported on every reconcile.
+	annotationHash = "acm-cmcertificate-sync.stilll.fr/certificate-hash"
+
+	// requeueDeleteInUse is how long to wait before retrying deletion of an
+	// ACM certificate that is still attached to another AWS resource.
+	requeueDeleteInUse = time.Minute
+)
+
+// ACMSyncer is the ACM surface the reconciler needs; *awsacm.AWSACMService
+// implements it, tests provide a mock.
+type ACMSyncer interface {
+	ImportCertificate(ctx context.Context, req awsacm.ImportRequest) (string, error)
+	DeleteCertificate(ctx context.Context, arn string) error
+	FindCertificateByDomains(ctx context.Context, domains []string) (string, error)
+}
+
+// Config holds the controller filtering options.
+type Config struct {
+	// WatchedNamespaces limits reconciliation to these namespaces. Empty means all.
+	WatchedNamespaces []string
+	// DomainPatterns limits reconciliation to Certificates whose domains match
+	// at least one pattern (filepath.Match syntax). Empty means all.
+	DomainPatterns []string
+}
+
+// ConfigFromEnv reads the controller configuration from the environment
+// variables set by the Helm chart (WATCHED_NAMESPACES, DOMAIN_PATTERNS).
+func ConfigFromEnv() Config {
+	return Config{
+		WatchedNamespaces: parseListEnv(os.Getenv("WATCHED_NAMESPACES"), "all-namespaces"),
+		DomainPatterns:    parseListEnv(os.Getenv("DOMAIN_PATTERNS"), "*"),
+	}
+}
+
+// parseListEnv splits a comma-separated env value, trimming blanks. The
+// allValue sentinel (and an empty value) both mean "no filtering" → nil.
+func parseListEnv(value, allValue string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == allValue {
+		return nil
+	}
+	var items []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
 
 type CertManagerCertificateReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	AWSACMService *aws_acm_svc.AWSACMService
+	Log    logr.Logger
+	Scheme *runtime.Scheme
+	ACM    ACMSyncer
+	Config Config
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CertManagerCertificateReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Fetch namespaces and domain patterns from environment variables
-	watchedNamespaces := os.Getenv("WATCHED_NAMESPACES")
-	domainPatterns := strings.Split(os.Getenv("DOMAIN_PATTERNS"), ",")
-
-	// Create a predicate to filter by namespace
-	namespacePredicate := predicate.Funcs{
+	// Events for Certificates we do not manage are dropped here. Certificates
+	// carrying our finalizer always pass so cleanup keeps working even after a
+	// configuration change narrows the filters.
+	managedPredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			return r.namespaceFilter(e.Object.GetNamespace(), watchedNamespaces)
+			return r.isManaged(e.Object)
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			return r.namespaceFilter(e.ObjectNew.GetNamespace(), watchedNamespaces)
+			return r.isManaged(e.ObjectNew)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
-			return r.namespaceFilter(e.Object.GetNamespace(), watchedNamespaces)
+			// Actual cleanup happens through the finalizer (an update event);
+			// by the time the delete event fires there is nothing left to do.
+			return false
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return r.isManaged(e.Object)
 		},
 	}
-
-	// Create a predicate to filter by domain patterns
-	domainPredicate := predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			cert := e.Object.(*certmanagerv1.Certificate)
-			return r.domainPatternFilter(cert.Spec.DNSNames, domainPatterns)
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			cert := e.ObjectNew.(*certmanagerv1.Certificate)
-			return r.domainPatternFilter(cert.Spec.DNSNames, domainPatterns)
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			cert := e.Object.(*certmanagerv1.Certificate)
-			return r.domainPatternFilter(cert.Spec.DNSNames, domainPatterns)
-		},
-	}
-
-	// Combine both predicates: namespace and domain pattern
-	combinedPredicate := predicate.And(namespacePredicate, domainPredicate)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&certmanagerv1.Certificate{}).
-		WithEventFilter(combinedPredicate). // Apply the combined filter
+		WithEventFilter(managedPredicate).
 		Complete(r)
 }
 
-// Helper method to filter namespaces
-func (r *CertManagerCertificateReconciler) namespaceFilter(namespace, watchedNamespaces string) bool {
-	if watchedNamespaces == "" || watchedNamespaces == "all-namespaces" {
+// isManaged reports whether this controller is responsible for the object.
+func (r *CertManagerCertificateReconciler) isManaged(obj client.Object) bool {
+	cert, ok := obj.(*certmanagerv1.Certificate)
+	if !ok {
+		return false
+	}
+	if controllerutil.ContainsFinalizer(cert, certificateFinalizer) {
 		return true
 	}
-	namespaces := strings.Split(watchedNamespaces, ",")
-	for _, ns := range namespaces {
-		if ns == namespace {
+	return r.namespaceMatches(cert.Namespace) && r.domainsMatch(certificateDomains(cert))
+}
+
+func (r *CertManagerCertificateReconciler) namespaceMatches(namespace string) bool {
+	if len(r.Config.WatchedNamespaces) == 0 {
+		return true
+	}
+	for _, watched := range r.Config.WatchedNamespaces {
+		if watched == namespace {
 			return true
 		}
 	}
 	return false
 }
 
-// Helper method to filter by domain patterns
-func (r *CertManagerCertificateReconciler) domainPatternFilter(dnsNames []string, patterns []string) bool {
-	for _, dnsName := range dnsNames {
-		for _, pattern := range patterns {
-			if matchDomainPattern(dnsName, pattern) {
+// domainsMatch reports whether at least one domain matches one configured pattern.
+func (r *CertManagerCertificateReconciler) domainsMatch(domains []string) bool {
+	if len(r.Config.DomainPatterns) == 0 {
+		return len(domains) > 0
+	}
+	for _, domain := range domains {
+		for _, pattern := range r.Config.DomainPatterns {
+			if matchDomainPattern(domain, pattern) {
 				return true
 			}
 		}
@@ -101,119 +156,189 @@ func (r *CertManagerCertificateReconciler) domainPatternFilter(dnsNames []string
 	return false
 }
 
-// Helper function to check if a domain matches the pattern
+// matchDomainPattern checks a single domain against a wildcard pattern.
+// filepath.Match semantics: "*" crosses dots, so "*.example.com" matches
+// "a.example.com" and "a.b.example.com", but not the apex "example.com".
 func matchDomainPattern(domain, pattern string) bool {
-	// Implement pattern matching (wildcards, etc.) as necessary
-	matched, _ := filepath.Match(pattern, domain)
-	return matched
+	matched, err := filepath.Match(pattern, domain)
+	return err == nil && matched
+}
+
+// certificateDomains returns the full domain set of a Certificate: its
+// DNS names plus the common name when it is not already listed.
+func certificateDomains(cert *certmanagerv1.Certificate) []string {
+	domains := make([]string, 0, len(cert.Spec.DNSNames)+1)
+	domains = append(domains, cert.Spec.DNSNames...)
+	if cn := cert.Spec.CommonName; cn != "" {
+		found := false
+		for _, domain := range domains {
+			if domain == cn {
+				found = true
+				break
+			}
+		}
+		if !found {
+			domains = append(domains, cn)
+		}
+	}
+	return domains
 }
 
 func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("certificate", req.NamespacedName)
 
-	// Fetch the Certificate resource from Cert Manager
 	var certificate certmanagerv1.Certificate
-	err := r.Get(ctx, req.NamespacedName, &certificate)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("Certificate resource not found in cluster. Attempting cleanup in AWS ACM.")
-			// TODO: Stocker les DNSNames dans une annotation ou dans le finalizer lors de la création pour pouvoir les retrouver ici
-			// Pour l'instant, on ne peut pas supprimer proprement sans cette info
-			// log.Info("Cannot delete from ACM: DNSNames unknown after K8s deletion")
+	if err := r.Get(ctx, req.NamespacedName, &certificate); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Already gone: ACM cleanup happened through the finalizer.
 			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Failed to get Certificate")
 		return ctrl.Result{}, err
 	}
 
-	// Add the finalizer if it doesn't exist
-	if err := r.addFinalizer(&certificate); err != nil {
-		return reconcile.Result{}, err
+	if !certificate.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, log, &certificate)
 	}
-	// Handle deletion: if DeletionTimestamp is set, remove from ACM and remove finalizer
-	if !certificate.ObjectMeta.DeletionTimestamp.IsZero() {
-		// TODO: Utiliser une annotation pour retrouver les DNSNames ici
-		// for _, dnsName := range certificate.Spec.DNSNames { ... }
-		// Remove our finalizer to allow deletion to complete
-		finalizers := certificate.GetFinalizers()
-		newFinalizers := []string{}
-		for _, f := range finalizers {
-			if f != certificateFinalizer {
-				newFinalizers = append(newFinalizers, f)
-			}
-		}
-		certificate.SetFinalizers(newFinalizers)
-		if err := r.Update(ctx, &certificate); err != nil {
-			log.Error(err, "Failed to remove finalizer")
-			return ctrl.Result{}, err
-		}
-		log.Info("Finalizer removed, resource can be deleted")
+
+	// Defense in depth: the event filter already checks this, but Reconcile can
+	// be invoked outside the filtered path.
+	if !r.isManaged(&certificate) {
 		return ctrl.Result{}, nil
 	}
 
-	// Check if the certificate is ready by looking at its conditions
-	isReady := false
-	for _, cond := range certificate.Status.Conditions {
-		if cond.Type == certmanagerv1.CertificateConditionReady && cond.Status == "True" {
-			isReady = true
-			break
-		}
-	}
-
-	if !isReady {
-		log.Info("Certificate is not ready yet, skipping reconciliation.")
+	if !isCertificateReady(&certificate) {
+		// A status update will trigger a new reconcile once the cert is issued.
+		log.Info("Certificate is not ready yet, skipping")
 		return ctrl.Result{}, nil
 	}
 
-	// Fetch the secret that contains the certificate
-	secretName := certificate.Spec.SecretName
 	var secret corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: secretName}, &secret); err != nil {
-		log.Error(err, "Failed to get Secret containing certificate data")
+	secretKey := client.ObjectKey{Namespace: certificate.Namespace, Name: certificate.Spec.SecretName}
+	if err := r.Get(ctx, secretKey, &secret); err != nil {
+		log.Error(err, "Failed to get Secret containing certificate data", "secret", secretKey)
 		return ctrl.Result{}, err
 	}
 
-	// Extract the certificate, private key, and certificate chain from the secret
-	certData, certExists := secret.Data["tls.crt"]
-	keyData, keyExists := secret.Data["tls.key"]
-
-	if !certExists || !keyExists {
-		log.Error(fmt.Errorf("secret data missing required fields"), "Secret does not contain required certificate data")
+	certData, certExists := secret.Data[corev1.TLSCertKey]
+	keyData, keyExists := secret.Data[corev1.TLSPrivateKeyKey]
+	if !certExists || !keyExists || len(certData) == 0 || len(keyData) == 0 {
+		// Not retryable until the secret changes, which will trigger a reconcile
+		// of the Certificate through its status update.
+		log.Info("Secret is missing tls.crt or tls.key, skipping", "secret", secretKey)
 		return ctrl.Result{}, nil
 	}
 
-	// Import the certificate into AWS ACM
-	// Loop over the DNS names in the certificate and import the certificate for each domain
-	for _, dnsName := range certificate.Spec.DNSNames {
-		if err := r.AWSACMService.ImportOrUpdateCertificate(dnsName, string(certData), string(keyData)); err != nil {
-			log.Error(err, "Failed to import certificate to AWS ACM")
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	// Skip when the exact same certificate was already imported.
+	hash := hashCertificate(certData)
+	arn := certificate.Annotations[annotationARN]
+	if arn != "" && certificate.Annotations[annotationHash] == hash {
+		return ctrl.Result{}, nil
+	}
+
+	// Take ownership before touching AWS so nothing leaks if we crash between
+	// the import and the annotation update.
+	if controllerutil.AddFinalizer(&certificate, certificateFinalizer) {
+		if err := r.Update(ctx, &certificate); err != nil {
+			log.Error(err, "Failed to add finalizer")
+			return ctrl.Result{}, err
 		}
 	}
 
-	log.Info("Successfully imported certificate to AWS ACM")
+	leafPEM, chainPEM, err := awsacm.SplitCertificateAndChain(string(certData))
+	if err != nil {
+		log.Error(err, "Secret contains invalid certificate data", "secret", secretKey)
+		return ctrl.Result{}, nil
+	}
+
+	// No ARN recorded yet: adopt an existing ACM certificate with the same
+	// domain set if there is one, instead of creating a duplicate.
+	if arn == "" {
+		arn, err = r.ACM.FindCertificateByDomains(ctx, certificateDomains(&certificate))
+		if err != nil {
+			log.Error(err, "Failed to look up existing ACM certificate")
+			return ctrl.Result{}, err
+		}
+		if arn != "" {
+			log.Info("Adopting existing ACM certificate", "certificateArn", arn)
+		}
+	}
+
+	importedARN, err := r.ACM.ImportCertificate(ctx, awsacm.ImportRequest{
+		ARN:            arn,
+		CertificatePEM: leafPEM,
+		ChainPEM:       chainPEM,
+		PrivateKeyPEM:  string(keyData),
+		Tags: map[string]string{
+			awsacm.ManagedByTagKey: awsacm.ManagedByTagValue,
+			"KubernetesNamespace":  certificate.Namespace,
+			"KubernetesName":       certificate.Name,
+		},
+	})
+	if err != nil {
+		log.Error(err, "Failed to import certificate into AWS ACM")
+		// Returning the error gives us exponential backoff on retries.
+		return ctrl.Result{}, err
+	}
+
+	patch := client.MergeFrom(certificate.DeepCopy())
+	if certificate.Annotations == nil {
+		certificate.Annotations = map[string]string{}
+	}
+	certificate.Annotations[annotationARN] = importedARN
+	certificate.Annotations[annotationHash] = hash
+	if err := r.Patch(ctx, &certificate, patch); err != nil {
+		log.Error(err, "Failed to record ACM ARN on Certificate")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Synced certificate to AWS ACM", "certificateArn", importedARN)
 	return ctrl.Result{}, nil
 }
 
-const certificateFinalizer = "acm-cmcertificate-sync/finalizer"
-
-// Add the finalizer to the certificate if it doesn't exist
-func (r *CertManagerCertificateReconciler) addFinalizer(cert *certmanagerv1.Certificate) error {
-	if !containsString(cert.GetFinalizers(), certificateFinalizer) {
-		cert.SetFinalizers(append(cert.GetFinalizers(), certificateFinalizer))
-		if err := r.Update(context.TODO(), cert); err != nil {
-			return err
-		}
+// reconcileDelete removes the ACM copy of a Certificate being deleted, then
+// releases the finalizer.
+func (r *CertManagerCertificateReconciler) reconcileDelete(ctx context.Context, log logr.Logger, certificate *certmanagerv1.Certificate) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(certificate, certificateFinalizer) {
+		return ctrl.Result{}, nil
 	}
-	return nil
+
+	if arn := certificate.Annotations[annotationARN]; arn != "" {
+		if err := r.ACM.DeleteCertificate(ctx, arn); err != nil {
+			if awsacm.IsInUse(err) {
+				// Still attached to an ALB/CloudFront/... — retry until the
+				// user detaches it. The Certificate stays in Terminating.
+				log.Info("ACM certificate still in use, retrying later", "certificateArn", arn)
+				return ctrl.Result{RequeueAfter: requeueDeleteInUse}, nil
+			}
+			log.Error(err, "Failed to delete certificate from AWS ACM", "certificateArn", arn)
+			return ctrl.Result{}, err
+		}
+	} else {
+		log.Info("No ACM ARN recorded on Certificate, nothing to delete in ACM")
+	}
+
+	controllerutil.RemoveFinalizer(certificate, certificateFinalizer)
+	if err := r.Update(ctx, certificate); err != nil {
+		log.Error(err, "Failed to remove finalizer")
+		return ctrl.Result{}, err
+	}
+	log.Info("Finalizer removed, Certificate deletion can complete")
+	return ctrl.Result{}, nil
 }
 
-// Helper functions for handling finalizers
-func containsString(slice []string, s string) bool {
-	for _, item := range slice {
-		if item == s {
-			return true
+func isCertificateReady(cert *certmanagerv1.Certificate) bool {
+	for _, cond := range cert.Status.Conditions {
+		if cond.Type == certmanagerv1.CertificateConditionReady {
+			return cond.Status == cmmeta.ConditionTrue
 		}
 	}
 	return false
+}
+
+// hashCertificate returns a stable digest of the certificate material used to
+// detect renewals.
+func hashCertificate(certData []byte) string {
+	sum := sha256.Sum256(certData)
+	return fmt.Sprintf("sha256:%s", hex.EncodeToString(sum[:]))
 }
