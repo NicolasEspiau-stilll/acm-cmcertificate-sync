@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -36,8 +37,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	"github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/controller"
-	services "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync.git/internal/services"
+	"github.com/NicolasEspiau-stilll/acm-cmcertificate-sync/internal/controller"
+	awsacm "github.com/NicolasEspiau-stilll/acm-cmcertificate-sync/internal/services"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -150,18 +151,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Instantiate the AWS ACM service
-	awsACMService, err := services.NewAWSACMService(os.Getenv("AWS_REGION"))
+	// Instantiate the AWS ACM service. The region is optional: when AWS_REGION
+	// is empty the SDK resolves it from the default credential/config chain.
+	awsACMService, err := awsacm.NewAWSACMService(context.Background(), os.Getenv("AWS_REGION"))
 	if err != nil {
 		setupLog.Error(err, "unable to create AWS ACM service")
 		os.Exit(1)
 	}
 
 	if err = (&controller.CertManagerCertificateReconciler{
-		Client:        mgr.GetClient(),
-		Log:           ctrl.Log.WithName("controllers").WithName("CertificateSync"),
-		Scheme:        mgr.GetScheme(),
-		AWSACMService: awsACMService,
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("CertificateSync"),
+		Scheme: mgr.GetScheme(),
+		ACM:    awsACMService,
+		Config: controller.ConfigFromEnv(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CertificateSync")
 		os.Exit(1)

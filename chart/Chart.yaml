@@ -1,6 +1,6 @@
 apiVersion: v2
-name: AWS Certificate Manager CertManager Sync controller
-description: ACM CM Sync controller syncs CertManager certificates with AWS Certificate Manager
+name: acm-cmcertificate-sync
+description: Syncs cert-manager certificates with AWS Certificate Manager
 
 # A chart can be either an 'application' or a 'library' chart.
 #

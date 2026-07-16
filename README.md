@@ -3,10 +3,32 @@
 ## Description
 
 This Kubernetes addon will automatically:
-- import Certificates issued by Cert Manager in your cluster to AWS Cert Manager
-- delete from AWS Cert Manager all Certificates deleted from your cluster
+- import Certificates issued by cert-manager in your cluster into AWS Certificate Manager (ACM)
+- re-import renewed certificates **onto the same ACM ARN**, so resources referencing the certificate (ALB listeners, CloudFront, ...) keep working across renewals
+- delete the ACM copy when the Certificate is deleted from the cluster (via a finalizer)
 
 It's designed for AWS clusters (EKS or not) as it will use AWS IAM Role and perform ACM actions.
+
+### How it works
+
+- One ACM certificate is maintained **per cert-manager Certificate** (not per DNS name). All SANs are covered by the single imported certificate.
+- The controller records the ACM ARN and a digest of the imported certificate in annotations on the Certificate resource:
+  - `acm-cmcertificate-sync.stilll.fr/certificate-arn`
+  - `acm-cmcertificate-sync.stilll.fr/certificate-hash`
+- Unchanged certificates are never re-imported; renewals are detected through the digest and re-imported in place.
+- If no ARN is recorded yet, the controller looks for an existing imported ACM certificate with the exact same domain set and adopts it instead of creating a duplicate.
+- On deletion, a finalizer (`acm-cmcertificate-sync.stilll.fr/finalizer`) guarantees the ACM copy is removed first. If the ACM certificate is still attached to an AWS resource, deletion is retried every minute until you detach it (the Certificate stays in `Terminating` meanwhile).
+- ACM certificates created by the controller are tagged with `ManagedBy=acm-cmcertificate-sync`, plus the Kubernetes namespace and name.
+
+### Configuration
+
+Set through the Helm values (rendered as environment variables):
+
+| Value | Env var | Meaning |
+|---|---|---|
+| `acmcertmanagersync.awsRegion` | `AWS_REGION` | AWS region for ACM. Optional: when empty the SDK default chain resolves it. |
+| `acmcertmanagersync.namespaces` | `WATCHED_NAMESPACES` | Namespaces to watch. Empty means all namespaces. |
+| `acmcertmanagersync.domainPatterns` | `DOMAIN_PATTERNS` | Only Certificates with at least one domain matching one pattern are synced. Empty means all. Wildcards use `filepath.Match` syntax: `*.example.com` matches any subdomain depth but **not** the apex `example.com` (add it as its own pattern). |
 
 ## Read this if you're a user
 
@@ -27,7 +49,8 @@ It's designed for AWS clusters (EKS or not) as it will use AWS IAM Role and perf
                 "acm:ImportCertificate",
                 "acm:DescribeCertificate",
                 "acm:DeleteCertificate",
-                "acm:ListCertificates"
+                "acm:ListCertificates",
+                "acm:AddTagsToCertificate"
             ],
             "Resource": "*"
         }
@@ -89,12 +112,16 @@ helm install --namespace acm-cm-sync --create-namespace acm-cm-sync acm-cmcertif
 
 And you want to contribute, or simply fork and use the project on your side.
 
-> [!WARNING]
-> I am not a proefficient Go developer. I chose Go because it works well with kubernetes api but I'm so bad at writting tests.
-> Don't hesitate to fork and create pull requests with tests (or any other improvement).
+Run the unit tests with:
+
+```sh
+make test
+```
+
+The tests use the controller-runtime fake client and a mocked ACM API: no cluster, no AWS account and no kubebuilder binaries are required.
 
 ### Prerequisites
-- go version v1.22.0+
+- go version v1.24+
 - docker version 17.03+.
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
@@ -114,29 +141,6 @@ make docker-build docker-push IMG=<some-registry>/acm-cmcertificate-sync:tag
 **NOTE:** This image ought to be published in the personal registry you specified.
 And it is required to have access to pull the image from the working environment.
 Make sure you have the proper permission to the registry if the above commands don’t work.
-
-## Project Distribution
-
-Following are the steps to build the installer and distribute this project to users.
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/acm-cmcertificate-sync:tag
-```
-
-NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without
-its dependencies.
-
-2. Using the installer
-
-Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/acm-cmcertificate-sync/<tag or branch>/dist/install.yaml
-```
 
 ## Contributing
 // TODO(user): Add detailed information on how you would like others to contribute to this project
