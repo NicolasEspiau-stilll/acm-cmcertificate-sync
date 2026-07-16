@@ -204,6 +204,7 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 	// Defense in depth: the event filter already checks this, but Reconcile can
 	// be invoked outside the filtered path.
 	if !r.isManaged(&certificate) {
+		log.V(1).Info("Certificate does not match namespace/domain filters, ignoring")
 		return ctrl.Result{}, nil
 	}
 
@@ -300,6 +301,12 @@ func (r *CertManagerCertificateReconciler) Reconcile(ctx context.Context, req ct
 // releases the finalizer.
 func (r *CertManagerCertificateReconciler) reconcileDelete(ctx context.Context, log logr.Logger, certificate *certmanagerv1.Certificate) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(certificate, certificateFinalizer) {
+		// Nothing to clean up on our side. Stale finalizers from other (or
+		// older) controllers can hold the object in Terminating forever, and
+		// such objects otherwise look healthy in kubectl: say so out loud.
+		if others := certificate.GetFinalizers(); len(others) > 0 {
+			log.Info("Certificate is being deleted but is held by foreign finalizers, ignoring", "finalizers", others)
+		}
 		return ctrl.Result{}, nil
 	}
 
