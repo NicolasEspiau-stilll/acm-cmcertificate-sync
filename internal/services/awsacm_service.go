@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -21,6 +22,11 @@ const (
 	ManagedByTagKey   = "ManagedBy"
 	ManagedByTagValue = "acm-cmcertificate-sync"
 )
+
+// awsCallTimeout bounds every individual AWS API call. Without it a wedged
+// connection blocks the reconcile queue forever: the manager runs reconciles
+// sequentially, so one hung call silently starves every other Certificate.
+const awsCallTimeout = 30 * time.Second
 
 // ACMAPI is the subset of the AWS ACM client used by this service.
 // It exists so tests can substitute a mock for the real client.
@@ -93,7 +99,9 @@ func (svc *AWSACMService) ImportCertificate(ctx context.Context, req ImportReque
 		})
 	}
 
-	output, err := svc.Client.ImportCertificate(ctx, input)
+	callCtx, cancel := context.WithTimeout(ctx, awsCallTimeout)
+	defer cancel()
+	output, err := svc.Client.ImportCertificate(callCtx, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to import certificate into ACM: %w", err)
 	}
@@ -120,7 +128,11 @@ func (svc *AWSACMService) FindCertificateByDomains(ctx context.Context, domains 
 	}
 	paginator := acm.NewListCertificatesPaginator(svc.Client, input)
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
+		page, err := func() (*acm.ListCertificatesOutput, error) {
+			pageCtx, cancel := context.WithTimeout(ctx, awsCallTimeout)
+			defer cancel()
+			return paginator.NextPage(pageCtx)
+		}()
 		if err != nil {
 			return "", fmt.Errorf("failed to list ACM certificates: %w", err)
 		}
@@ -146,7 +158,9 @@ func (svc *AWSACMService) certificateDomains(ctx context.Context, summary acmtyp
 	if !aws.ToBool(summary.HasAdditionalSubjectAlternativeNames) {
 		return normalizeDomainSet(summary.SubjectAlternativeNameSummaries), nil
 	}
-	described, err := svc.Client.DescribeCertificate(ctx, &acm.DescribeCertificateInput{
+	callCtx, cancel := context.WithTimeout(ctx, awsCallTimeout)
+	defer cancel()
+	described, err := svc.Client.DescribeCertificate(callCtx, &acm.DescribeCertificateInput{
 		CertificateArn: summary.CertificateArn,
 	})
 	if err != nil {
@@ -159,7 +173,9 @@ func (svc *AWSACMService) certificateDomains(ctx context.Context, summary acmtyp
 // already gone is not an error. Use IsInUse to detect certificates that are
 // still attached to another AWS resource.
 func (svc *AWSACMService) DeleteCertificate(ctx context.Context, arn string) error {
-	_, err := svc.Client.DeleteCertificate(ctx, &acm.DeleteCertificateInput{
+	callCtx, cancel := context.WithTimeout(ctx, awsCallTimeout)
+	defer cancel()
+	_, err := svc.Client.DeleteCertificate(callCtx, &acm.DeleteCertificateInput{
 		CertificateArn: aws.String(arn),
 	})
 	if err != nil {
